@@ -3,6 +3,7 @@
 #include <cmath>
 #include <random>
 #include <set>
+#include <sstream>
 #include <algorithm>
 #include "weapons.h"
 
@@ -109,7 +110,7 @@ class PairTool : public Tool {
     UndoEntry u;
     u.label = label;
     u.joints.push_back(nj->id);
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     return true;
   }
 
@@ -120,6 +121,7 @@ class PairTool : public Tool {
 class WeldTool : public PairTool {
  public:
   const char* name() const override { return "Weld"; }
+  void params(ParamIO& p) override { p.b(nocollide_); }
   const char* desc() const override { return "Rigidly attach two objects together (or an object to the world)."; }
   void settings() override { ImGui::Checkbox("No-collide welded objects", &nocollide_); }
 
@@ -158,6 +160,7 @@ class NoCollideTool : public PairTool {
 class BallSocketTool : public PairTool {
  public:
   const char* name() const override { return "Ball Socket"; }
+  void params(ParamIO& p) override { p.b(nocollide_); }
   const char* desc() const override { return "Pin two objects together at a point; they can rotate freely."; }
   void settings() override { ImGui::Checkbox("No-collide", &nocollide_); }
 
@@ -181,6 +184,7 @@ class BallSocketTool : public PairTool {
 class AxisTool : public PairTool {
  public:
   const char* name() const override { return "Axis"; }
+  void params(ParamIO& p) override { p.f(friction_), p.b(nocollide_); }
   const char* desc() const override {
     return "Hinge two objects. The hinge axis is the surface normal where you first clicked.";
   }
@@ -214,6 +218,10 @@ class AxisTool : public PairTool {
 class RopeTool : public PairTool {
  public:
   RopeTool(JointType t) : type_(t) {}
+  void params(ParamIO& p) override {
+    p.f(addLength_), p.f(width_), p.f(strength_), p.f(damping_), p.f(restScale_), p.f(speed_);
+    p.i(keyIn_), p.i(keyOut_), p.c(color_);
+  }
   const char* name() const override {
     return type_ == JointType::Rope ? "Rope" : type_ == JointType::Elastic ? "Elastic" : "Winch";
   }
@@ -273,6 +281,7 @@ class RopeTool : public PairTool {
 class ThrusterTool : public Tool {
  public:
   const char* name() const override { return "Thruster"; }
+  void params(ParamIO& p) override { p.f(force_), p.i(key_), p.b(toggle_); }
   const char* category() const override { return "Gadgets"; }
   const char* desc() const override { return "Attach a thruster that pushes the object while its key is held."; }
   std::string help() const override { return "Left: attach thruster   Reload: remove thrusters from object"; }
@@ -294,7 +303,7 @@ class ThrusterTool : public Tool {
     UndoEntry u;
     u.label = "Thruster";
     u.attachments.push_back({h.prop->id, na->id});
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     return true;
   }
   bool reload(GameCtx& c, const ToolHit& h) override { return clear(c, h, AttachKind::Thruster); }
@@ -315,6 +324,7 @@ class ThrusterTool : public Tool {
 class HoverballTool : public Tool {
  public:
   const char* name() const override { return "Hoverball"; }
+  void params(ParamIO& p) override { p.i(up_), p.i(down_), p.f(speed_), p.f(strength_); }
   const char* category() const override { return "Gadgets"; }
   const char* desc() const override { return "Keeps the object hovering at a height you can raise and lower."; }
   std::string help() const override { return "Left: attach hoverball   Reload: remove hoverballs from object"; }
@@ -339,7 +349,7 @@ class HoverballTool : public Tool {
     UndoEntry u;
     u.label = "Hoverball";
     u.attachments.push_back({h.prop->id, na->id});
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     return true;
   }
   bool reload(GameCtx& c, const ToolHit& h) override { return ThrusterTool::clear(c, h, AttachKind::Hoverball); }
@@ -352,6 +362,7 @@ class HoverballTool : public Tool {
 class WheelTool : public Tool {
  public:
   const char* name() const override { return "Wheel"; }
+  void params(ParamIO& p) override { p.f(radius_), p.f(torque_), p.f(speed_), p.i(fwd_), p.i(back_); }
   const char* category() const override { return "Gadgets"; }
   const char* desc() const override { return "Attach a motorised wheel. Forward/back keys drive it."; }
   std::string help() const override { return "Left: attach wheel   Reload: remove wheels from object"; }
@@ -396,7 +407,7 @@ class WheelTool : public Tool {
     u.label = "Wheel";
     u.props.push_back(w->id);
     if (nj) u.joints.push_back(nj->id);
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     return true;
   }
   bool reload(GameCtx& c, const ToolHit& h) override {
@@ -416,6 +427,7 @@ class WheelTool : public Tool {
 class BalloonTool : public Tool {
  public:
   const char* name() const override { return "Balloon"; }
+  void params(ParamIO& p) override { p.f(lift_), p.f(length_), p.b(random_), p.c(color_); }
   const char* category() const override { return "Gadgets"; }
   const char* desc() const override { return "Tie a balloon to something. Enough of them will lift it."; }
   std::string help() const override { return "Left: attach balloon"; }
@@ -452,7 +464,7 @@ class BalloonTool : public Tool {
     j.width = 0.012f;
     j.color = glm::vec4(0.9f, 0.9f, 0.88f, 1);
     if (Joint* nj = c.world.addJoint(j)) u.joints.push_back(nj->id);
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     return true;
   }
 
@@ -465,6 +477,7 @@ class BalloonTool : public Tool {
 class DynamiteTool : public Tool {
  public:
   const char* name() const override { return "Dynamite"; }
+  void params(ParamIO& p) override { p.i(key_), p.f(power_), p.b(weld_); }
   const char* category() const override { return "Gadgets"; }
   const char* desc() const override { return "Place dynamite. Press its key to blow it up."; }
   std::string help() const override { return "Left: place dynamite   Right: detonate everything now"; }
@@ -490,7 +503,7 @@ class DynamiteTool : public Tool {
       j.nocollide = true;
       if (Joint* nj = c.world.addJoint(j)) u.joints.push_back(nj->id);
     }
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     c.notify.push(std::string("Dynamite placed - press ") + SDL_GetScancodeName((SDL_Scancode)key_) + " to detonate");
     return true;
   }
@@ -511,6 +524,7 @@ class DynamiteTool : public Tool {
 class LampTool : public Tool {
  public:
   const char* name() const override { return "Lamp"; }
+  void params(ParamIO& p) override { p.c(color_), p.f(range_), p.i(key_); }
   const char* category() const override { return "Gadgets"; }
   const char* desc() const override { return "Place a glowing light. Its key toggles it on and off."; }
   std::string help() const override { return "Left: place lamp"; }
@@ -537,7 +551,7 @@ class LampTool : public Tool {
       j.nocollide = true;
       if (Joint* nj = c.world.addJoint(j)) u.joints.push_back(nj->id);
     }
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     return true;
   }
 
@@ -585,6 +599,7 @@ class RemoverTool : public Tool {
 class ColorTool : public Tool {
  public:
   const char* name() const override { return "Colour"; }
+  void params(ParamIO& p) override { p.c(color_); }
   const char* category() const override { return "Render"; }
   const char* desc() const override { return "Paint objects."; }
   std::string help() const override { return "Left: apply colour   Right: copy colour   Reload: reset"; }
@@ -612,6 +627,7 @@ class ColorTool : public Tool {
 class MaterialTool : public Tool {
  public:
   const char* name() const override { return "Material"; }
+  void params(ParamIO& p) override { p.i(mat_); }
   const char* category() const override { return "Render"; }
   const char* desc() const override { return "Change what objects look like they are made of."; }
   std::string help() const override { return "Left: apply material   Right: copy material"; }
@@ -636,6 +652,7 @@ class MaterialTool : public Tool {
 class WeightTool : public Tool {
  public:
   const char* name() const override { return "Weight"; }
+  void params(ParamIO& p) override { p.f(mass_); }
   const char* category() const override { return "Utility"; }
   const char* desc() const override { return "Change how heavy an object is."; }
   std::string help() const override { return "Left: apply weight   Right: copy weight"; }
@@ -693,7 +710,7 @@ class DuplicatorTool : public Tool {
     UndoEntry u;
     u.label = "Duplication";
     c.world.deserialize(data_, ref, &u);
-    c.world.pushUndo(u);
+    c.pushUndo(u);
     return true;
   }
   bool reload(GameCtx& c, const ToolHit&) override {
@@ -708,6 +725,43 @@ class DuplicatorTool : public Tool {
 };
 
 }  // namespace
+
+std::string Tool::saveSettings() {
+  struct W : ParamIO {
+    std::ostringstream o;
+    void f(float& v) override { o << v << ' '; }
+    void i(int& v) override { o << v << ' '; }
+    void b(bool& v) override { o << (v ? 1 : 0) << ' '; }
+    void c(glm::vec4& v) override { o << v.x << ' ' << v.y << ' ' << v.z << ' ' << v.w << ' '; }
+  } w;
+  w.o.precision(7);
+  params(w);
+  return w.o.str();
+}
+
+void Tool::loadSettings(const std::string& str) {
+  struct R : ParamIO {
+    std::istringstream in;
+    void f(float& v) override {
+      float x;
+      if (in >> x) v = x;
+    }
+    void i(int& v) override {
+      int x;
+      if (in >> x) v = x;
+    }
+    void b(bool& v) override {
+      int x;
+      if (in >> x) v = x != 0;
+    }
+    void c(glm::vec4& v) override {
+      glm::vec4 x;
+      if (in >> x.x >> x.y >> x.z >> x.w) v = x;
+    }
+  } r;
+  r.in.str(str);
+  params(r);
+}
 
 std::vector<std::unique_ptr<Tool>> makeTools() {
   std::vector<std::unique_ptr<Tool>> t;

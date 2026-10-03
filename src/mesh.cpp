@@ -10,6 +10,7 @@ void MeshData::append(const MeshData& o, const glm::mat4& xf) {
     Vertex w;
     w.pos = glm::vec3(xf * glm::vec4(v.pos, 1.0f));
     w.normal = glm::normalize(nm * v.normal);
+    w.color = v.color;
     verts.push_back(w);
   }
   for (uint32_t i : o.idx) idx.push_back(base + i);
@@ -24,7 +25,7 @@ void MeshData::addFlatPoly(const std::vector<glm::vec3>& pts, const glm::vec3& i
   bool flip = glm::dot(n, c - inside) < 0;
   if (flip) n = -n;
   uint32_t base = (uint32_t)verts.size();
-  for (auto& p : pts) verts.push_back({p, n});
+  for (auto& p : pts) verts.push_back({p, n, glm::vec3(1.0f)});
   for (size_t i = 1; i + 1 < pts.size(); i++) {
     if (!flip) {
       idx.push_back(base); idx.push_back(base + (uint32_t)i); idx.push_back(base + (uint32_t)i + 1);
@@ -60,6 +61,8 @@ void Mesh::upload(const MeshData& d) {
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
   glEnableVertexAttribArray(1);
   glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, normal));
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, color));
   glBindVertexArray(0);
   count = (GLsizei)d.idx.size();
   bmin = glm::vec3(1e9f);

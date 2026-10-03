@@ -26,6 +26,33 @@ void Player::init(Physics& phys, const glm::vec3& feet, float y) {
   postPhysics(0);
 }
 
+void Player::initRemote(Physics& phys, const glm::vec3& feet) {
+  phys_ = &phys;
+  shape_ = new btCapsuleShape(kRadius, kHeight - 2 * kRadius);
+  auto* ms = new btDefaultMotionState(makeXf(feet + glm::vec3(0, kHalf, 0)));
+  btRigidBody::btRigidBodyConstructionInfo ci(0.0f, ms, shape_, btVector3(0, 0, 0));
+  ci.m_friction = 0.0f;
+  body = new btRigidBody(ci);
+  body->setCollisionFlags(body->getCollisionFlags() | btCollisionObject::CF_KINEMATIC_OBJECT);
+  body->setActivationState(DISABLE_DEACTIVATION);
+  body->setUserIndex(BODY_PLAYER);
+  phys.world->addRigidBody(body, COL_PLAYER, COL_ALL);
+}
+
+void Player::setRemoteState(const glm::vec3& feet, const glm::vec3& eye, float y, float p, bool nc) {
+  btTransform t = makeXf(feet + glm::vec3(0, kHalf, 0));
+  body->getMotionState()->setWorldTransform(t);
+  body->setWorldTransform(t);
+  int flags = body->getCollisionFlags();
+  body->setCollisionFlags(nc ? flags | btCollisionObject::CF_NO_CONTACT_RESPONSE
+                             : flags & ~btCollisionObject::CF_NO_CONTACT_RESPONSE);
+  yaw = y;
+  pitch = p;
+  cam.pos = eye;
+  cam.yaw = y;
+  cam.pitch = p;
+}
+
 void Player::shutdown() {
   if (!body) return;
   if (!noclip) phys_->world->removeRigidBody(body);
@@ -91,6 +118,7 @@ void Player::update(const Input& in, float dt, bool controls) {
   float fwdIn = 0, sideIn = 0, upIn = 0;
   bool sprint = false, jump = false;
   crouching = false;
+  jumped = false;
   if (controls) {
     fwdIn = (in.down[SDL_SCANCODE_W] ? 1.0f : 0.0f) - (in.down[SDL_SCANCODE_S] ? 1.0f : 0.0f);
     sideIn = (in.down[SDL_SCANCODE_D] ? 1.0f : 0.0f) - (in.down[SDL_SCANCODE_A] ? 1.0f : 0.0f);
@@ -141,6 +169,7 @@ void Player::update(const Input& in, float dt, bool controls) {
     v.y = 5.3f + std::max(0.0f, groundVel.y);
     jumpCooldown_ = 0.25f;
     onGround = false;
+    jumped = true;
   }
   v.x = vh.x + groundVel.x;
   v.z = vh.y + groundVel.z;

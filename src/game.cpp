@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <random>
 #include "gl.h"
+#include "net.h"
 #include "ui.h"
 
 namespace fs = std::filesystem;
@@ -25,6 +26,9 @@ static std::string defaultSaveDir() {
   return base + "/better-gmod-clone/saves";
 }
 
+Game::Game() = default;
+Game::~Game() = default;
+
 bool Game::init(int argc, char** argv) {
   int w = 1600, h = 900;
   bool fullscreen = false;
@@ -35,8 +39,21 @@ bool Game::init(int argc, char** argv) {
     else if (a == "--fullscreen") fullscreen = true;
     else if (a == "--autotest") autotest_ = true;
     else if (a == "--shots" && i + 1 < argc) shotDir_ = argv[++i];
+    else if (a == "--name" && i + 1 < argc) playerName = argv[++i];
+    else if (a == "--host") startHost_ = (i + 1 < argc && isdigit((unsigned char)argv[i + 1][0])) ? argv[++i] : "27015";
+    else if (a == "--connect" && i + 1 < argc) startJoin_ = argv[++i];
+    else if (a == "--autotest-host") netTest_ = 1, autotest_ = true;
+    else if (a == "--autotest-client") netTest_ = 2, autotest_ = true;
     else if (a == "--help" || a == "-h") {
-      printf("Usage: gmodclone [--width W] [--height H] [--fullscreen] [--autotest] [--shots DIR]\n");
+      printf(
+          "Usage: gmodclone [options]\n"
+          "  --width W --height H   window size\n"
+          "  --fullscreen           borderless fullscreen\n"
+          "  --name NAME            multiplayer name\n"
+          "  --host [PORT]          host a multiplayer game (default port 27015)\n"
+          "  --connect HOST[:PORT]  join a multiplayer game\n"
+          "  --autotest             run the scripted single-player self test\n"
+          "  --shots DIR            where autotest screenshots go\n");
       return false;
     }
   }
@@ -74,6 +91,12 @@ bool Game::init(int argc, char** argv) {
   printf("OpenGL %s | %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
   glEnable(GL_MULTISAMPLE);
 
+  setAssetDir(findAssetDir(argv[0]));
+  if (assetDir().empty())
+    fprintf(stderr, "Asset folder not found - imported models and sound files are disabled\n");
+  else
+    printf("Assets: %s\n", assetDir().c_str());
+
   if (!renderer.init()) {
     fprintf(stderr, "Renderer init failed\n");
     return false;
@@ -89,7 +112,7 @@ bool Game::init(int argc, char** argv) {
   ImGui_ImplSDL2_InitForOpenGL(window_, gl_);
   ImGui_ImplOpenGL3_Init("#version 330");
 
-  audio.init();
+  audio.init(assetDir());
   physics.init();
   world.audio = &audio;
   world.buildMap();
@@ -99,12 +122,21 @@ bool Game::init(int argc, char** argv) {
   weapons.emplace_back(new GravGun());
   weapons.emplace_back(new ToolGun());
 
+  if (playerName == "Player")
+    if (const char* u = getenv("USER"); u && *u) playerName = u;
+  net = std::make_unique<Net>(*this);
+  net->name = playerName;
+
   physics.onPreTick = [this](float dt) {
     world.preTick(dt);
-    GameCtx c = makeCtx();
-    weapon()->preTick(c, dt);
+    if (!net->isClient()) {
+      GameCtx c = makeCtx();
+      weapon()->preTick(c, dt);
+    }
+    net->preTick(dt);
   };
   world.onExplosion = [this](const glm::vec3& pos, float radius, float power) {
+    net->broadcastExplosion(pos, radius, power);
     glm::vec3 d = player.center() - pos;
     float dist = glm::length(d);
     if (dist < radius * 2.0f) shake_ = std::max(shake_, 1.0f - dist / (radius * 2.0f));
@@ -114,15 +146,75 @@ bool Game::init(int argc, char** argv) {
     }
   };
 
+  buildIcons();
   saveDir = defaultSaveDir();
   std::error_code ec;
   fs::create_directories(saveDir, ec);
   updateMouseMode();
   notify.push("Welcome! Hold Q to spawn things.");
+  if (!startHost_.empty()) hostGame(atoi(startHost_.c_str()));
+  if (!startJoin_.empty()) joinGame(startJoin_);
   return true;
 }
 
+void Game::buildIcons() {
+  Uint64 t0 = SDL_GetPerformanceCounter();
+  for (const PropDef& d : propCatalog()) {
+    if (!propAvailable(d)) continue;
+    std::vector<DrawCmd> cmds;
+    if (d.special == Special::Ragdoll) {
+      world.ragdollPreview(cmds);
+    } else {
+      DrawCmd c;
+      c.mesh = assets.mesh(d.shape);
+      c.color = d.color;
+      c.material = d.material;
+      c.model = glm::mat4(1);
+      // Long thin things look better standing at an angle.
+      if (d.shape.kind == ShapeKind::Cylinder && d.shape.size.y < d.shape.size.x * 0.5f)
+        c.model = glm::rotate(glm::mat4(1), 1.2f, glm::vec3(1, 0, 0));
+      cmds.push_back(c);
+    }
+    icons[d.id] = renderer.renderIcon(cmds, 128);
+  }
+  printf("Rendered %zu spawn icons in %.0f ms\n", icons.size(),
+         (SDL_GetPerformanceCounter() - t0) * 1000.0 / SDL_GetPerformanceFrequency());
+}
+
+bool Game::hostGame(int port) {
+  std::string err;
+  net->name = playerName;
+  if (!net->host(port, err)) {
+    notify.push(err, glm::vec4(1, 0.3f, 0.3f, 1));
+    return false;
+  }
+  notify.push("Hosting on port " + std::to_string(port), glm::vec4(0.4f, 1, 0.5f, 1));
+  return true;
+}
+
+bool Game::joinGame(const std::string& address) {
+  std::string host = address;
+  int port = net::kDefaultPort;
+  size_t colon = address.rfind(':');
+  if (colon != std::string::npos) {
+    host = address.substr(0, colon);
+    port = atoi(address.c_str() + colon + 1);
+  }
+  std::string err;
+  net->name = playerName;
+  if (!net->connect(host, port, err)) {
+    notify.push(err, glm::vec4(1, 0.3f, 0.3f, 1));
+    return false;
+  }
+  notify.push("Connecting to " + host + ":" + std::to_string(port) + "...");
+  return true;
+}
+
+int Game::localHeld() { return net->isClient() ? net->self.held : weapon()->heldProp(); }
+
 void Game::shutdown() {
+  net.reset();
+  for (auto& kv : icons) glDeleteTextures(1, &kv.second);
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();
   ImGui::DestroyContext();
@@ -164,7 +256,11 @@ void Game::selectWeapon(int i) {
 }
 
 void Game::doUndo() {
-  std::string label = world.undo();
+  if (net->isClient()) {
+    net->sendUndo();
+    return;
+  }
+  std::string label = world.undo(0);
   if (!label.empty()) {
     notify.push("Undone " + label);
     audio.play(SND_UNDO, 0.6f);
@@ -174,11 +270,19 @@ void Game::doUndo() {
 }
 
 void Game::spawnProp(const PropDef& def) {
-  glm::vec3 eye = player.cam.pos, fwd = player.cam.forward();
-  RayHit h = physics.raycast(eye, eye + fwd * 80.0f, player.body);
+  if (net->isClient()) {
+    net->sendSpawn(def.id, player.cam.pos, player.cam.forward(), player.yaw);
+    return;
+  }
+  spawnPropFor(def, player.cam.pos, player.cam.forward(), player.yaw, 0, audio);
+}
+
+void Game::spawnPropFor(const PropDef& def, const glm::vec3& eye, const glm::vec3& fwd, float yaw, int owner,
+                        SoundOut& sound) {
+  RayHit h = physics.raycast(eye, eye + fwd * 80.0f, nullptr, COL_WORLD | COL_PROP);
   glm::vec3 pos = h.hit ? h.point : eye + fwd * 8.0f;
   glm::vec3 n = h.hit ? h.normal : glm::vec3(0, 1, 0);
-  glm::quat rot = yawQuat(player.yaw + 3.14159265f);
+  glm::quat rot = yawQuat(yaw + 3.14159265f);
   float d = 0.0f;
   if (def.special != Special::Ragdoll) {
     btCollisionShape* s = assets.shape(def.shape);
@@ -192,9 +296,10 @@ void Game::spawnProp(const PropDef& def) {
   pos += n * (d + 0.02f);
   UndoEntry u;
   u.label = def.special == Special::Ragdoll ? "Ragdoll" : def.name;
+  u.owner = owner;
   world.spawn(def, makeXf(pos, rot), &u);
   world.pushUndo(u);
-  audio.play(SND_SPAWN, 0.5f);
+  sound.play(SND_SPAWN, 0.5f);
 }
 
 static std::string sanitize(const std::string& s) {
@@ -205,6 +310,10 @@ static std::string sanitize(const std::string& s) {
 }
 
 bool Game::saveGame(const std::string& name) {
+  if (net->isClient()) {
+    notify.push("Only the host can save", glm::vec4(1, 0.6f, 0.3f, 1));
+    return false;
+  }
   std::string path = saveDir + "/" + sanitize(name) + ".gsave";
   bool ok = world.saveFile(path, player.feet(), player.yaw, player.pitch);
   if (!ok) notify.push("Could not save to " + path, glm::vec4(1, 0.3f, 0.3f, 1));
@@ -212,6 +321,10 @@ bool Game::saveGame(const std::string& name) {
 }
 
 bool Game::loadGame(const std::string& name) {
+  if (net->isClient()) {
+    notify.push("Only the host can load saves", glm::vec4(1, 0.6f, 0.3f, 1));
+    return false;
+  }
   std::string path = saveDir + "/" + sanitize(name) + ".gsave";
   GameCtx c = makeCtx();
   for (auto& w : weapons) w->holster(c);
@@ -256,7 +369,19 @@ void Game::screenshot(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
+void Game::releaseAllInput() {
+  for (int i = 0; i < SDL_NUM_SCANCODES; i++)
+    if (input.down[i]) net->sendInput(0, i, false);
+  for (int i = 0; i < 8; i++)
+    if (input.mouseDown[i]) net->sendInput(1, i, false);
+  input.releaseAll();
+}
+
 void Game::handleEvent(const SDL_Event& e) {
+  if (e.type == SDL_TEXTINPUT && suppressText_) {  // the 'T' that opened the chat box
+    suppressText_ = false;
+    return;
+  }
   ImGui_ImplSDL2_ProcessEvent(&e);
   ImGuiIO& io = ImGui::GetIO();
   bool playing = !spawnMenu && !paused;
@@ -268,12 +393,16 @@ void Game::handleEvent(const SDL_Event& e) {
         SDL_GL_GetDrawableSize(window_, &dw, &dh);
         renderer.resize(dw, dh);
       } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST && !autotest_) {
-        input.releaseAll();
+        releaseAllInput();
         if (!spawnMenu) paused = true;
       }
       break;
     case SDL_KEYDOWN: {
       SDL_Scancode sc = e.key.keysym.scancode;
+      if (chatOpen) {
+        if (sc == SDL_SCANCODE_ESCAPE) chatOpen = false;
+        break;
+      }
       if (io.WantTextInput && sc != SDL_SCANCODE_ESCAPE) break;
       if (e.key.repeat) {
         if (sc == SDL_SCANCODE_Z && !paused) doUndo();
@@ -281,7 +410,17 @@ void Game::handleEvent(const SDL_Event& e) {
       }
       input.down[sc] = true;
       input.pressed[sc] = true;
+      if (!paused) net->sendInput(0, sc, true);
       switch (sc) {
+        case SDL_SCANCODE_T:
+        case SDL_SCANCODE_RETURN:
+          if (!paused && !spawnMenu) {
+            chatOpen = true;
+            chatBuf[0] = 0;
+            suppressText_ = sc == SDL_SCANCODE_T;
+            releaseAllInput();
+          }
+          break;
         case SDL_SCANCODE_ESCAPE:
           if (showHelp) showHelp = false;
           else if (spawnMenu) spawnMenu = false;
@@ -329,6 +468,7 @@ void Game::handleEvent(const SDL_Event& e) {
     }
     case SDL_KEYUP: {
       SDL_Scancode sc = e.key.keysym.scancode;
+      if (input.down[sc]) net->sendInput(0, sc, false);
       input.down[sc] = false;
       input.released[sc] = true;
       if (sc == SDL_SCANCODE_Q && spawnMenu && time - qOpenTime_ > 0.3f && !io.WantTextInput) spawnMenu = false;
@@ -338,16 +478,20 @@ void Game::handleEvent(const SDL_Event& e) {
       if (playing) {
         input.mdx += (float)e.motion.xrel;
         input.mdy += (float)e.motion.yrel;
+        net->addMotion((float)e.motion.xrel, (float)e.motion.yrel, 0);
       }
       break;
     case SDL_MOUSEBUTTONDOWN:
       if (playing && e.button.button < 8) {
         input.mouseDown[e.button.button] = true;
         input.mousePressed[e.button.button] = true;
+        net->sendToolSettings();
+        net->sendInput(1, e.button.button, true);
       }
       break;
     case SDL_MOUSEBUTTONUP:
       if (e.button.button < 8) {
+        if (input.mouseDown[e.button.button]) net->sendInput(1, e.button.button, false);
         input.mouseDown[e.button.button] = false;
         input.mouseReleased[e.button.button] = true;
       }
@@ -356,8 +500,10 @@ void Game::handleEvent(const SDL_Event& e) {
       if (playing) {
         int dy = e.wheel.y;
         if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dy = -dy;
-        if (weapon()->consumesWheel()) {
+        bool consumes = net->isClient() ? (curWeapon == 0 && net->self.held >= 0) : weapon()->consumesWheel();
+        if (consumes) {
           input.wheel += dy;
+          net->addMotion(0, 0, dy);
         } else if (dy != 0) {
           int n = (int)weapons.size();
           selectWeapon(((curWeapon - (dy > 0 ? 1 : -1)) % n + n) % n);
@@ -365,6 +511,72 @@ void Game::handleEvent(const SDL_Event& e) {
       }
       break;
   }
+}
+
+void Game::renderPlayers(const Camera& cam) {
+  nameTags.clear();
+  static const glm::vec3 kColors[] = {{1, 1, 1},       {0.6f, 0.8f, 1},  {1, 0.7f, 0.6f}, {0.7f, 1, 0.6f},
+                                      {1, 0.95f, 0.5f}, {0.9f, 0.6f, 1}, {0.5f, 1, 1},    {1, 0.6f, 0.85f}};
+  bool haveModel = modelExists("soldier");
+  auto beamFor = [&](const PlayerView& v, const glm::vec3& muzzle) {
+    if (v.beamType == 1) {
+      std::vector<glm::vec3> pts;
+      glm::vec3 fwd(std::cos(v.pitch) * std::sin(v.yaw), std::sin(v.pitch), -std::cos(v.pitch) * std::cos(v.yaw));
+      glm::vec3 ctrl = v.eye + fwd * (glm::length(v.beamEnd - v.eye) * 0.5f);
+      for (int i = 0; i <= 20; i++) {
+        float t = i / 20.0f;
+        pts.push_back((1 - t) * (1 - t) * muzzle + 2 * (1 - t) * t * ctrl + t * t * v.beamEnd);
+      }
+      renderer.beam(pts, glm::vec4(0.25f, 0.65f, 1.0f, 1.0f), 0.05f, true);
+      renderer.beam(pts, glm::vec4(0.25f, 0.65f, 1.0f, 0.35f), 0.18f, true);
+      renderer.light({v.beamEnd, glm::vec3(0.3f, 0.6f, 1.5f), 4.0f});
+    } else if (v.beamType == 2) {
+      renderer.beam({muzzle, v.beamEnd}, glm::vec4(1.0f, 0.6f, 0.2f, 0.5f), 0.12f, true);
+    } else if (v.beamType == 3) {
+      renderer.beam({muzzle, v.beamEnd}, glm::vec4(0.6f, 0.85f, 1.0f, 0.8f), 0.04f, true);
+    }
+    if (v.held >= 0) world.highlights[v.held] = glm::vec4(0.3f, 0.7f, 1.0f, 0.9f);
+  };
+  for (const PlayerView& v : net->others) {
+    glm::vec3 col = kColors[v.id % 8];
+    glm::mat4 base = glm::translate(glm::mat4(1), v.feet) *
+                     glm::rotate(glm::mat4(1), 3.14159265f - v.yaw, glm::vec3(0, 1, 0)) *
+                     glm::scale(glm::mat4(1), glm::vec3(1, v.crouch ? 0.65f : 1.0f, 1));
+    if (haveModel) {
+      DrawCmd c;
+      c.mesh = assets.mesh(ShapeDesc{ShapeKind::Model, glm::vec3(1), "soldier"});
+      c.model = base * glm::translate(glm::mat4(1), glm::vec3(0, 0.9f, 0));
+      c.color = glm::vec4(col, 1);
+      c.material = MAT_PAINTED;
+      renderer.draw(c);
+    } else {
+      DrawCmd b;
+      b.mesh = assets.mesh(ShapeDesc{ShapeKind::Capsule, glm::vec3(0.3f, 0.45f, 0), ""});
+      b.model = base * glm::translate(glm::mat4(1), glm::vec3(0, 0.75f, 0));
+      b.color = glm::vec4(col * 0.8f, 1);
+      renderer.draw(b);
+      DrawCmd hd;
+      hd.mesh = assets.mesh(ShapeDesc{ShapeKind::Sphere, glm::vec3(0.18f, 0, 0), ""});
+      hd.model = base * glm::translate(glm::mat4(1), glm::vec3(0, 1.62f, 0));
+      hd.color = glm::vec4(0.9f, 0.75f, 0.6f, 1);
+      renderer.draw(hd);
+    }
+    glm::vec3 fwd(std::cos(v.pitch) * std::sin(v.yaw), std::sin(v.pitch), -std::cos(v.pitch) * std::cos(v.yaw));
+    glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0, 1, 0)) + glm::vec3(1e-4f, 0, 0));
+    glm::vec3 muzzle = v.eye + right * 0.25f - glm::vec3(0, 0.25f, 0) + fwd * 0.5f;
+    // held weapon
+    DrawCmd w;
+    w.mesh = assets.mesh(ShapeDesc{ShapeKind::Box, glm::vec3(0.05f, 0.06f, 0.25f), ""});
+    w.model = glm::translate(glm::mat4(1), muzzle - fwd * 0.25f) *
+              glm::mat4_cast(glm::quatLookAt(fwd, glm::vec3(0, 1, 0)));
+    w.color = v.weapon == 0 ? glm::vec4(0.3f, 0.5f, 0.9f, 1)
+                            : v.weapon == 1 ? glm::vec4(0.9f, 0.5f, 0.1f, 1) : glm::vec4(0.7f, 0.7f, 0.75f, 1);
+    w.material = MAT_METAL;
+    renderer.draw(w);
+    beamFor(v, muzzle);
+    if (glm::length(v.feet - cam.pos) < 60.0f) nameTags.push_back({v.feet + glm::vec3(0, 2.05f, 0), v.name});
+  }
+  if (net->isClient()) beamFor(net->self, frameMuzzle_);
 }
 
 void Game::playImpactSounds() {
@@ -403,15 +615,22 @@ void Game::frame(float dt) {
   fps = fps * 0.95f + (1.0f / std::max(dt, 1e-4f)) * 0.05f;
   notify.update(dt);
   if (hintTimer > 0) hintTimer -= dt;
-  if (autotest_) autotestStep(dt);
+  if (autotest_) {
+    if (netTest_)
+      netAutotestStep(dt);
+    else
+      autotestStep(dt);
+  }
   updateMouseMode();
 
   ImGuiIO& io = ImGui::GetIO();
-  bool playing = !spawnMenu && !paused;
-  bool controls = !paused && !io.WantTextInput;
+  bool client = net->isClient();
+  bool playing = !spawnMenu && !paused && !chatOpen;
+  bool controls = !paused && !io.WantTextInput && !chatOpen;
   static const Input kEmpty{};
 
-  if (playing && !weapon()->locksView()) player.look(input.mdx, input.mdy, mouseSens);
+  bool lockView = client ? (curWeapon == 0 && input.down[SDL_SCANCODE_E] && net->self.held >= 0) : weapon()->locksView();
+  if (playing && !lockView) player.look(input.mdx, input.mdy, mouseSens);
   player.cam.fov = fov;
   player.update(controls ? input : kEmpty, dt, controls);
 
@@ -421,19 +640,34 @@ void Game::frame(float dt) {
   frameEye_ = aim.pos;
   frameFwd_ = aim.forward();
   frameMuzzle_ = weapon()->muzzleWorld(aim, player.bob);
-  {
+  if (!client) {
     GameCtx c = makeCtx();
     weapon()->update(c, playing ? input : kEmpty, dt);
+  } else {
+    weapon()->updateSway(playing ? input : kEmpty, dt);
+    if (Tool* t = toolgun()->tool()) t->setStage(net->self.toolStage);
   }
-  world.update(dt, controls ? input.down : kEmpty.down);
-  if (!paused) physics.step(dt);
+  net->update(dt);
+  client = net->isClient();
+  static bool keys[SDL_NUM_SCANCODES];
+  memcpy(keys, controls ? input.down : kEmpty.down, sizeof(keys));
+  if (net->isHost()) net->combineKeys(keys);
+  world.update(dt, keys);
+  if (!paused || !net->offline()) physics.step(dt);
   player.postPhysics(dt);
-  playImpactSounds();
+  if (!client) playImpactSounds();
+  net->afterPhysics(dt);
 
   // Audio state
   audio.setListener(player.cam.pos, player.cam.right());
-  audio.setLoop(LOOP_PHYSGUN, SND_HUM, curWeapon == 0 && weapon()->active() && !paused, 0.5f);
+  bool physgunOn = client ? net->self.beamType == 1 : weapon()->active();
+  audio.setLoop(LOOP_PHYSGUN, SND_HUM, curWeapon == 0 && physgunOn && !paused, 0.5f);
   audio.setLoop(LOOP_THRUST, SND_THRUST, world.anyThrusterOn() && !paused, 0.5f);
+  audio.setLoop(LOOP_ENGINE, SND_ENGINE, world.anyMotorOn() && !paused, 0.45f);
+  audio.setLoop(LOOP_FOOTSTEPS, SND_FOOTSTEPS, player.onGround && player.speedH > 1.0f && !paused, 0.35f,
+                player.speedH > 6.0f ? 1.35f : 1.0f);
+  audio.setLoop(LOOP_AMBIENCE, SND_AMBIENCE, !paused, 0.25f);
+  if (player.jumped) audio.play(SND_JUMP, 0.35f);
 
   // Camera shake
   Camera cam = player.cam;
@@ -448,10 +682,11 @@ void Game::frame(float dt) {
   renderer.begin(cam, time);
   frameMuzzle_ = weapon()->muzzleWorld(cam, player.bob);
   frameEye_ = cam.pos;
-  {
+  if (!client) {
     GameCtx c = makeCtx();
     weapon()->render(c, renderer);
   }
+  renderPlayers(cam);
   world.render(renderer, cam);
   weapon()->renderViewmodel(renderer, assets, cam, player.bob);
   renderer.render();
@@ -463,6 +698,7 @@ void Game::frame(float dt) {
   if (spawnMenu) ui::drawSpawnMenu(*this);
   if (paused) ui::drawPauseMenu(*this);
   if (showHelp) ui::drawHelp(*this);
+  if (chatOpen) ui::drawChat(*this);
   ImGui::Render();
   glViewport(0, 0, renderer.width, renderer.height);
   ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -557,6 +793,26 @@ void Game::autotestStep(float dt) {
     cartId = world.spawn(*findPropDef("cart"), makeXf({0, 1.3f, 0}), &u)->id;
     world.pushUndo(u);
     check(world.props.size() == 26, "spawned props (incl. 11 ragdoll parts)");
+    // Imported models (only when the asset folder is present)
+    struct M {
+      const char* id;
+      glm::vec3 pos;
+      float yaw;
+    };
+    const M models[] = {{"truck_red", {-9, 1.2f, 2}, 0.6f},  {"statue", {9, 1.1f, 5}, -0.5f},
+                        {"tree", {-11, 1.9f, 9}, 0},        {"stairs", {10, 0.6f, -3}, 1.57f},
+                        {"house_a", {-16, 2.3f, -6}, 0.3f},  {"question_block", {7, 3.0f, 9}, 0.2f},
+                        {"motorcycle", {-6, 0.7f, -2}, 1.0f}, {"fountain", {16, 1.2f, 8}, 0}};
+    UndoEntry mu;
+    int placed = 0;
+    for (const M& m : models)
+      if (const PropDef* d = findPropDef(m.id); d && propAvailable(*d)) {
+        world.spawn(*d, makeXf(m.pos, yawQuat(m.yaw)), &mu);
+        placed++;
+      }
+    world.pushUndo(mu);
+    modelProps_ = placed;
+    if (!assetDir().empty()) check(placed == 8, "spawned imported models");
     check(world.joints.size() == 10, "ragdoll has 10 joints");
   }
   if (f == 40) {
@@ -693,8 +949,168 @@ void Game::autotestStep(float dt) {
     doUndo();
     check(world.props.size() == undoStartProps, "undo removes the duplication");
   }
-  if (f == 420) {
+  if (f == 412) {
+    player.setNoclip(false);
+    player.teleport(glm::vec3(2, 0.1f, 14), glm::radians(-40.0f), glm::radians(-5.0f));
+  }
+  if (f == 418) screenshot(shotDir_ + "/autotest_toolgun.bmp");
+  if (f == 425) {
     printf("[autotest] finished with %d failure(s)\n", g_autotestFailures);
+    running = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Two-process multiplayer self-test:
+//   gmodclone --host 27999 --autotest-host   and   gmodclone --connect 127.0.0.1:27999 --autotest-client
+// ---------------------------------------------------------------------------
+void Game::netAutotestStep(float dt) {
+  int f = autoFrame_++;
+  static int stage = 0, stageFrame = 0, target = -1;
+  static float startY = 0;
+  auto check = [&](bool ok, const std::string& what) {
+    printf("[netest-%s] %-46s %s\n", netTest_ == 1 ? "host" : "client", what.c_str(), ok ? "OK" : "FAIL");
+    fflush(stdout);
+    if (!ok) g_autotestFailures++;
+  };
+  auto next = [&]() {
+    stage++;
+    stageFrame = f;
+  };
+  auto lookAt = [&](const glm::vec3& t) {
+    glm::vec3 d = t - player.cam.pos;
+    player.yaw = std::atan2(d.x, -d.z);
+    player.pitch = std::atan2(d.y, std::sqrt(d.x * d.x + d.z * d.z));
+  };
+  auto chatHas = [&](const std::string& s) {
+    for (auto& c : net->chatLines)
+      if (c.text.find(s) != std::string::npos) return true;
+    return false;
+  };
+  int waited = f - stageFrame;
+  if (f > 5000) {
+    check(false, "timed out in stage " + std::to_string(stage));
+    running = false;
+    return;
+  }
+
+  if (netTest_ == 1) {  // ---------------- host ----------------
+    if (stage == 0) {
+      player.teleport(glm::vec3(0, 0.1f, 18), 0, -0.1f);
+      UndoEntry u;
+      for (int i = 0; i < 5; i++) world.spawn(*findPropDef("crate_small"), makeXf({-2.0f + i, 0.32f, 8}), &u);
+      world.pushUndo(u);
+      check(net->isHost(), "hosting");
+      next();
+    } else if (stage == 1) {
+      if (net->remoteCount() > 0) {
+        check(true, "client connected");
+        next();
+      }
+    } else if (stage == 2) {
+      bool spawned = false, lifted = false, boom = false;
+      for (auto& kv : world.props) {
+        if (kv.second->type == "ball") spawned = true;
+        if (kv.second->type == "crate_small" && kv.second->pos().y > 1.5f) lifted = true;
+      }
+      static bool sawSpawn = false, sawLift = false;
+      if (spawned && !sawSpawn) check(sawSpawn = true, "client spawned a prop");
+      if (lifted && !sawLift) check(sawLift = true, "client lifted a crate with the physgun");
+      boom = chatHas("hello from client");
+      if (sawSpawn && sawLift && boom) {
+        check(true, "got chat from client");
+        player.teleport(glm::vec3(3, 0.1f, 18), glm::radians(10.0f), -0.15f);
+        next();
+      }
+    } else if (stage == 3 && waited == 20) {
+      screenshot(shotDir_ + "/net_host.bmp");
+    } else if (stage == 3 && waited == 30) {
+      net->chat("bye from host");
+    } else if (stage == 3 && waited == 120) {
+      printf("[netest-host] finished with %d failure(s)\n", g_autotestFailures);
+      running = false;
+    }
+    return;
+  }
+
+  // ---------------- client ----------------
+  if (stage == 0) {
+    if (net->connected() && world.props.size() >= 5) {
+      check(true, "connected and received the world");
+      player.teleport(glm::vec3(1, 0.1f, 13), 0, 0);
+      next();
+    }
+  } else if (stage == 1 && waited == 10) {
+    lookAt(glm::vec3(3, 0, 10));
+    spawnProp(*findPropDef("ball"));
+    next();
+  } else if (stage == 2) {
+    for (auto& kv : world.props)
+      if (kv.second->type == "ball") {
+        check(true, "spawned prop replicated back");
+        selectWeapon(0);
+        for (auto& kv2 : world.props)
+          if (kv2.second->type == "crate_small" && target < 0) target = kv2.first;
+        next();
+        break;
+      }
+  } else if (stage == 3) {
+    Prop* p = world.prop(target);
+    if (!p) return;
+    if (waited == 5) {
+      lookAt(p->pos());
+      startY = p->pos().y;
+    }
+    if (waited == 8) net->sendInput(1, SDL_BUTTON_LEFT, true);
+    if (waited == 30) check(net->self.held >= 0, "host says we hold the crate");
+    if (waited > 30 && waited < 70) player.pitch = std::min(1.2f, player.pitch + 0.02f);
+    if (waited == 90) {
+      float y = p->pos().y;
+      printf("[netest-client] crate y %.2f -> %.2f\n", startY, y);
+      check(y > startY + 1.0f, "crate movement replicated");
+      net->sendInput(1, SDL_BUTTON_LEFT, false);
+      next();
+    }
+  } else if (stage == 4) {
+    if (waited == 5) {
+      selectWeapon(2);
+      ToolGun* tg = toolgun();
+      for (size_t i = 0; i < tg->tools.size(); i++)
+        if (std::string(tg->tools[i]->name()) == "Dynamite") tg->select((int)i);
+      lookAt(glm::vec3(-1, 0, 9.5f));
+    }
+    if (waited == 15) {
+      net->sendToolSettings(true);
+      net->sendInput(1, SDL_BUTTON_LEFT, true);
+    }
+    if (waited == 17) net->sendInput(1, SDL_BUTTON_LEFT, false);
+    if (waited > 17) {
+      for (auto& kv : world.props)
+        if (kv.second->type == "dynamite") {
+          check(true, "placed dynamite with the tool gun");
+          next();
+          break;
+        }
+    }
+  } else if (stage == 5) {
+    if (waited == 10) {
+      net->sendInput(0, SDL_SCANCODE_B, true);
+      net->sendInput(0, SDL_SCANCODE_B, false);
+    }
+    if (waited > 10 && !world.effects.empty()) {
+      check(true, "dynamite explosion replicated");
+      lookAt(glm::vec3(0, 1.0f, 18));
+      next();
+    }
+  } else if (stage == 6) {
+    if (waited == 30) screenshot(shotDir_ + "/net_client.bmp");
+    if (waited == 35) net->chat("hello from client");
+    if (waited > 35 && chatHas("bye from host")) {
+      check(true, "got chat from host");
+      next();
+    }
+  } else if (stage == 7) {
+    printf("[netest-client] finished with %d failure(s)\n", g_autotestFailures);
     running = false;
   }
 }

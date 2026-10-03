@@ -19,11 +19,12 @@ enum Material {
   MAT_GLOW,
   MAT_CHROME,
   MAT_BRICK,
+  MAT_PAINTED,  // flat diffuse, used by imported models
   MAT_COUNT
 };
 const char* materialName(int m);
 
-enum class ShapeKind { Box, Sphere, Cylinder, Capsule, Cone, Wedge, Torus, Compound };
+enum class ShapeKind { Box, Sphere, Cylinder, Capsule, Cone, Wedge, Torus, Compound, Model };
 const char* shapeKindName(ShapeKind k);
 ShapeKind shapeKindFromName(const std::string& s);
 
@@ -31,6 +32,7 @@ ShapeKind shapeKindFromName(const std::string& s);
 //   Box/Wedge: half extents. Sphere: x = radius. Cylinder: x = radius, y = half height (Y axis).
 //   Capsule: x = radius, y = half height of the straight section. Cone: x = radius, y = height.
 //   Torus: x = major radius, y = tube radius. Compound: parts from compoundParts(compound).
+//   Model: `compound` names a converted model in assets/models/<name>.gmd (convex hull collision).
 struct ShapeDesc {
   ShapeKind kind = ShapeKind::Box;
   glm::vec3 size{0.5f};
@@ -56,10 +58,18 @@ struct PropDef {
   Special special = Special::None;
 };
 const std::vector<PropDef>& propCatalog();
+bool propAvailable(const PropDef& d);  // false if it needs a model file that isn't installed
 const PropDef* findPropDef(const std::string& id);
 std::vector<std::string> propCategories();
 
 MeshData buildShapeMesh(const ShapeDesc& d);
+
+// Directory holding models/ and sounds/ (found at startup, see findAssetDir()).
+std::string findAssetDir(const char* argv0);
+void setAssetDir(const std::string& dir);
+const std::string& assetDir();
+bool modelExists(const std::string& name);
+const MeshData* loadModel(const std::string& name);  // cached; nullptr if missing
 
 class Assets {
  public:

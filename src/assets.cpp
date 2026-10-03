@@ -1,20 +1,27 @@
 #include "assets.h"
+#include <SDL.h>
+#include <BulletCollision/CollisionShapes/btShapeHull.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 
 const char* materialName(int m) {
-  static const char* names[MAT_COUNT] = {"Plastic", "Dev Grid", "Wood",   "Crate",  "Metal",  "Concrete",
-                                         "Grass",   "Checker",  "Rubber", "Glow",   "Chrome", "Brick"};
+  static const char* names[MAT_COUNT] = {"Plastic", "Dev Grid", "Wood",   "Crate",  "Metal",  "Concrete", "Grass",
+                                         "Checker", "Rubber",   "Glow",   "Chrome", "Brick",  "Painted"};
   return (m >= 0 && m < MAT_COUNT) ? names[m] : "?";
 }
 
-static const char* kKindNames[] = {"box", "sphere", "cylinder", "capsule", "cone", "wedge", "torus", "compound"};
+static const char* kKindNames[] = {"box", "sphere", "cylinder", "capsule", "cone",
+                                   "wedge", "torus", "compound", "model"};
 
 const char* shapeKindName(ShapeKind k) { return kKindNames[(int)k]; }
 
 ShapeKind shapeKindFromName(const std::string& s) {
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < 9; i++)
     if (s == kKindNames[i]) return (ShapeKind)i;
   return ShapeKind::Box;
 }
@@ -89,6 +96,84 @@ const std::vector<SubBox>* compoundParts(const std::string& name) {
 }
 
 // ---------------------------------------------------------------------------
+// Imported models
+// ---------------------------------------------------------------------------
+static std::string g_assetDir;
+
+std::string findAssetDir(const char* argv0) {
+  namespace fs = std::filesystem;
+  std::vector<fs::path> candidates;
+  if (const char* e = getenv("GMODCLONE_ASSETS"); e && *e) candidates.push_back(e);
+  if (char* base = SDL_GetBasePath()) {
+    candidates.push_back(fs::path(base) / "assets");
+    candidates.push_back(fs::path(base) / ".." / "assets");
+    candidates.push_back(fs::path(base) / ".." / "share" / "better-gmod-clone" / "assets");
+    SDL_free(base);
+  }
+  candidates.push_back("assets");
+#ifdef GMOD_ASSET_DIR
+  candidates.push_back(GMOD_ASSET_DIR);
+#endif
+  (void)argv0;
+  for (auto& c : candidates) {
+    std::error_code ec;
+    if (fs::is_directory(c / "models", ec) || fs::is_directory(c / "sounds", ec))
+      return fs::weakly_canonical(c, ec).string();
+  }
+  return "";
+}
+
+void setAssetDir(const std::string& dir) { g_assetDir = dir; }
+const std::string& assetDir() { return g_assetDir; }
+
+static std::map<std::string, std::unique_ptr<MeshData>>& modelCache() {
+  static std::map<std::string, std::unique_ptr<MeshData>> c;
+  return c;
+}
+
+const MeshData* loadModel(const std::string& name) {
+  auto& cache = modelCache();
+  auto it = cache.find(name);
+  if (it != cache.end()) return it->second.get();
+  std::unique_ptr<MeshData> md;
+  if (!g_assetDir.empty()) {
+    std::ifstream f(g_assetDir + "/models/" + name + ".gmd", std::ios::binary);
+    char magic[4];
+    uint32_t nv = 0, ni = 0;
+    if (f.read(magic, 4) && memcmp(magic, "GMD1", 4) == 0 && f.read((char*)&nv, 4) && f.read((char*)&ni, 4) &&
+        nv < 10000000 && ni < 30000000) {
+      md = std::make_unique<MeshData>();
+      md->verts.resize(nv);
+      for (uint32_t i = 0; i < nv && f; i++) {
+        float pn[6];
+        unsigned char c[4];
+        f.read((char*)pn, sizeof(pn));
+        f.read((char*)c, 4);
+        Vertex& v = md->verts[i];
+        v.pos = glm::vec3(pn[0], pn[1], pn[2]);
+        glm::vec3 n(pn[3], pn[4], pn[5]);
+        v.normal = glm::length(n) > 1e-6f ? glm::normalize(n) : glm::vec3(0, 1, 0);
+        v.color = glm::vec3(c[0], c[1], c[2]) / 255.0f;
+      }
+      md->idx.resize(ni);
+      f.read((char*)md->idx.data(), ni * 4);
+      if (!f) {
+        fprintf(stderr, "Truncated model file: %s\n", name.c_str());
+        md.reset();
+      } else {
+        for (uint32_t& i : md->idx)
+          if (i >= nv) i = 0;
+      }
+    }
+  }
+  const MeshData* r = md.get();
+  cache[name] = std::move(md);
+  return r;
+}
+
+bool modelExists(const std::string& name) { return loadModel(name) != nullptr; }
+
+// ---------------------------------------------------------------------------
 // Spawn catalog
 // ---------------------------------------------------------------------------
 static PropDef def(const char* id, const char* name, const char* cat, ShapeKind k, glm::vec3 size, int mat,
@@ -108,6 +193,11 @@ static PropDef def(const char* id, const char* name, const char* cat, ShapeKind 
   d.friction = friction;
   d.special = sp;
   return d;
+}
+
+static PropDef model(const char* name, const char* title, const char* cat, float mass) {
+  return def(name, title, cat, ShapeKind::Model, {1, 1, 1}, MAT_PAINTED, {1, 1, 1}, mass, 0.15f, 0.8f,
+             Special::None, name);
 }
 
 const std::vector<PropDef>& propCatalog() {
@@ -156,6 +246,44 @@ const std::vector<PropDef>& propCatalog() {
       def("lamp", "Glow Lamp", "Fun", K::Sphere, {0.2f, 0, 0}, MAT_GLOW, {1.0f, 0.85f, 0.6f}, 3, 0.2f, 0.7f, Special::Lamp),
       def("balloon", "Balloon", "Fun", K::Sphere, {0.3f, 0, 0}, MAT_PLASTIC, {0.9f, 0.2f, 0.3f}, 0.2f, 0.5f, 0.7f, Special::Balloon),
       def("bowling", "Bowling Ball", "Fun", K::Sphere, {0.11f, 0, 0}, MAT_CHROME, {0.15f, 0.1f, 0.3f}, 7, 0.1f),
+      // Imported (Kenney, CC0) models
+      model("truck_red", "Red Truck", "Vehicles", 900),
+      model("truck_green", "Green Truck", "Vehicles", 900),
+      model("truck_purple", "Purple Truck", "Vehicles", 900),
+      model("truck_yellow", "Yellow Truck", "Vehicles", 900),
+      model("motorcycle", "Motorcycle", "Vehicles", 180),
+      model("drone", "Drone", "Vehicles", 25),
+      model("track_bump", "Track Bump", "Vehicles", 400),
+      model("statue", "Statue", "Decoration", 400),
+      model("column", "Column", "Decoration", 500),
+      model("column_damaged", "Broken Column", "Decoration", 350),
+      model("tree", "Tree", "Decoration", 150),
+      model("trees", "Bushy Trees", "Decoration", 300),
+      model("fountain", "Fountain", "Decoration", 1500),
+      model("banner", "Banner", "Decoration", 20),
+      model("flag", "Flag", "Decoration", 15),
+      model("cloud", "Cloud", "Decoration", 5),
+      model("trophy", "Trophy", "Decoration", 8),
+      model("coin", "Coin", "Decoration", 2),
+      model("question_block", "? Block", "Decoration", 40),
+      model("brick_block", "Brick Block", "Decoration", 40),
+      model("soldier", "Soldier", "Decoration", 70),
+      model("character", "Character", "Decoration", 60),
+      model("sword", "Sword", "Decoration", 3),
+      model("spear", "Spear", "Decoration", 4),
+      model("weapon_rack", "Weapon Rack", "Decoration", 40),
+      model("blaster", "Blaster", "Decoration", 4),
+      model("blaster_repeater", "Repeater", "Decoration", 5),
+      model("stairs", "Stairs", "Buildings", 800),
+      model("stone_wall", "Stone Wall", "Buildings", 1200),
+      model("wall_gate", "Wall Gate", "Buildings", 1100),
+      model("wall_low", "Low Wall", "Buildings", 600),
+      model("bricks", "Brick Pile", "Buildings", 150),
+      model("platform", "Platform", "Buildings", 700),
+      model("house_a", "House", "Buildings", 5000),
+      model("house_b", "Tall House", "Buildings", 6000),
+      model("house_c", "Tower House", "Buildings", 7000),
+      model("garage", "Garage", "Buildings", 4000),
   };
   return c;
 }
@@ -166,9 +294,12 @@ const PropDef* findPropDef(const std::string& id) {
   return nullptr;
 }
 
+bool propAvailable(const PropDef& d) { return d.shape.kind != ShapeKind::Model || modelExists(d.shape.compound); }
+
 std::vector<std::string> propCategories() {
   std::vector<std::string> cats;
   for (auto& d : propCatalog())
+    if (propAvailable(d))
     if (std::find(cats.begin(), cats.end(), d.category) == cats.end()) cats.push_back(d.category);
   return cats;
 }
@@ -189,6 +320,9 @@ MeshData buildShapeMesh(const ShapeDesc& d) {
         for (auto& p : *parts) m.append(meshgen::box(p.half), glm::translate(glm::mat4(1), p.pos));
       return m;
     }
+    case ShapeKind::Model:
+      if (const MeshData* md = loadModel(d.compound)) return *md;
+      return meshgen::box(glm::vec3(0.5f));
   }
   return meshgen::box(glm::vec3(0.5f));
 }
@@ -254,6 +388,23 @@ btCollisionShape* Assets::shape(const ShapeDesc& d) {
         }
       }
       s = c;
+      break;
+    }
+    case ShapeKind::Model: {
+      const MeshData* md = loadModel(d.compound);
+      btConvexHullShape full;
+      if (md)
+        for (auto& v : md->verts) full.addPoint(toBt(v.pos), false);
+      else
+        for (int i = 0; i < 8; i++) full.addPoint(btVector3(i & 1 ? .5f : -.5f, i & 2 ? .5f : -.5f, i & 4 ? .5f : -.5f), false);
+      full.recalcLocalAabb();
+      // Reduce to a cheap hull (~40 points).
+      btShapeHull hull(&full);
+      hull.buildHull(full.getMargin());
+      auto* h = new btConvexHullShape((const btScalar*)hull.getVertexPointer(), hull.numVertices(), sizeof(btVector3));
+      h->setMargin(0.01f);
+      h->recalcLocalAabb();
+      s = h;
       break;
     }
   }

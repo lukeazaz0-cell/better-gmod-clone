@@ -278,6 +278,18 @@ std::vector<int> World::spawnRagdoll(const btTransform& xf, UndoEntry* undo) {
   return ids;
 }
 
+void World::ragdollPreview(std::vector<DrawCmd>& out) {
+  static const glm::vec4 slots[3] = {{0.9f, 0.72f, 0.58f, 1}, {0.25f, 0.42f, 0.72f, 1}, {0.24f, 0.24f, 0.3f, 1}};
+  for (int i = 0; i < R_COUNT; i++) {
+    const RagPart& rp = kRagParts[i];
+    DrawCmd c;
+    c.mesh = assets.mesh(ShapeDesc{ShapeKind::Capsule, glm::vec3(rp.radius, rp.height * 0.5f, 0), ""});
+    c.model = glm::rotate(glm::translate(glm::mat4(1), rp.pos), rp.rotZ, glm::vec3(0, 0, 1));
+    c.color = slots[rp.colorSlot];
+    out.push_back(c);
+  }
+}
+
 void World::removeProp(int id) {
   auto it = props.find(id);
   if (it == props.end()) return;
@@ -314,6 +326,10 @@ Joint* World::joint(int id) {
 bool World::buildConstraint(Joint& j) {
   Prop* A = prop(j.a);
   if (!A) return false;
+  if (clientMode) {  // clients only keep constraints for drawing ropes
+    j.c = nullptr;
+    return j.b < 0 || prop(j.b);
+  }
   Prop* B = j.b >= 0 ? prop(j.b) : nullptr;
   if (j.b >= 0 && !B) return false;
   btRigidBody& ra = *A->body;
@@ -516,6 +532,41 @@ void World::explode(const glm::vec3& pos, float radius, float power) {
   if (onExplosion) onExplosion(pos, radius, power);
 }
 
+void World::makeKinematic(Prop& p) {
+  btRigidBody* b = p.body;
+  phys.world->removeRigidBody(b);
+  b->setMassProps(0, btVector3(0, 0, 0));
+  b->setCollisionFlags((b->getCollisionFlags() & ~btCollisionObject::CF_STATIC_OBJECT) |
+                       btCollisionObject::CF_KINEMATIC_OBJECT);
+  b->updateInertiaTensor();
+  phys.world->addRigidBody(b, COL_PROP, COL_ALL);
+  b->setActivationState(DISABLE_DEACTIVATION);
+}
+
+void World::setNetTransform(Prop& p, const btTransform& t, uint8_t flags) {
+  if (!p.netInit) {
+    p.netFrom = p.netTo = t;
+    p.netInit = true;
+    p.body->setWorldTransform(t);
+    p.body->getMotionState()->setWorldTransform(t);
+  } else {
+    p.netFrom = p.body->getWorldTransform();
+    p.netTo = t;
+  }
+  p.netT = 0;
+  bool thrust = flags & 1;
+  for (auto& a : p.attachments)
+    if (a.kind == AttachKind::Thruster) a.on = thrust;
+  if (p.special == Special::Lamp) p.on = (flags & 2) != 0;
+}
+
+void World::explodeVisual(const glm::vec3& pos, float radius) {
+  Effect e;
+  e.pos = pos;
+  e.size = radius * 0.45f;
+  effects.push_back(e);
+}
+
 Attachment* World::addAttachment(Prop& p, Attachment a) {
   a.id = nextAttach_++;
   p.attachments.push_back(a);
@@ -536,7 +587,7 @@ bool World::removeAttachment(int propId, int attId) {
 // Simulation
 // ---------------------------------------------------------------------------
 void World::keyEvent(int sc, bool down) {
-  if (!down) return;
+  if (!down || clientMode) return;
   std::vector<int> boom;
   for (auto& kv : props) {
     Prop& p = *kv.second;
@@ -557,6 +608,26 @@ void World::keyEvent(int sc, bool down) {
 
 void World::update(float dt, const bool* keys) {
   thrusting_ = false;
+  motoring_ = false;
+  if (clientMode) {
+    for (auto& kv : props) {
+      Prop& p = *kv.second;
+      if (p.flash > 0) p.flash -= dt;
+      for (auto& a : p.attachments)
+        if (a.kind == AttachKind::Thruster && a.on) thrusting_ = true;
+      if (!p.netInit || p.netT >= 1.0f) continue;
+      p.netT = std::min(1.0f, p.netT + dt * 30.0f);
+      btTransform t;
+      t.setOrigin(p.netFrom.getOrigin().lerp(p.netTo.getOrigin(), p.netT));
+      t.setRotation(p.netFrom.getRotation().slerp(p.netTo.getRotation(), p.netT));
+      p.body->setWorldTransform(t);
+      p.body->getMotionState()->setWorldTransform(t);
+    }
+    for (auto& e : effects) e.t += dt;
+    effects.erase(std::remove_if(effects.begin(), effects.end(), [](const Effect& e) { return e.t >= e.dur; }),
+                  effects.end());
+    return;
+  }
   // Count hoverballs per contraption to share the load.
   std::map<int, std::pair<float, int>> hoverInfo;  // root prop id -> (mass, count)
   std::map<int, int> rootOf;
@@ -604,6 +675,7 @@ void World::update(float dt, const bool* keys) {
       auto* h = static_cast<btHingeConstraint*>(j.c);
       bool f = keys[j.key1], b = keys[j.key2];
       if (f != b) {
+        motoring_ = true;
         h->enableAngularMotor(true, (f ? 1.0f : -1.0f) * j.speed * j.motorSign, j.torque * phys.fixedDt);
         if (Prop* a = prop(j.a)) a->body->activate(true);
         if (Prop* w = prop(j.b)) w->body->activate(true);
@@ -676,6 +748,7 @@ void World::solveRope(Joint& j, float dt) {
 }
 
 void World::preTick(float dt) {
+  if (clientMode) return;
   float g = phys.gravity();
   for (auto& kv : props) {
     Prop& p = *kv.second;
@@ -843,10 +916,12 @@ void World::pushUndo(const UndoEntry& e) {
   if (undo_.size() > 256) undo_.erase(undo_.begin());
 }
 
-std::string World::undo() {
-  while (!undo_.empty()) {
-    UndoEntry e = undo_.back();
-    undo_.pop_back();
+std::string World::undo(int owner) {
+  while (true) {
+    auto it = std::find_if(undo_.rbegin(), undo_.rend(), [&](const UndoEntry& u) { return u.owner == owner; });
+    if (it == undo_.rend()) break;
+    UndoEntry e = *it;
+    undo_.erase(std::next(it).base());
     bool did = false;
     for (int id : e.joints)
       if (joints.count(id)) {
@@ -924,7 +999,8 @@ std::string World::serialize(const std::vector<int>& ids, const btTransform& ref
   return o.str();
 }
 
-std::vector<int> World::deserialize(const std::string& data, const btTransform& ref, UndoEntry* undo) {
+std::vector<int> World::deserialize(const std::string& data, const btTransform& ref, UndoEntry* undo,
+                                    std::map<int, int>* idxToId) {
   std::istringstream in(data);
   std::string line;
   std::map<int, int> idmap, groupMap;
@@ -948,6 +1024,7 @@ std::vector<int> World::deserialize(const std::string& data, const btTransform& 
       sd.size = size;
       sd.compound = compound == "-" ? "" : compound;
       if (sd.kind == ShapeKind::Compound && !compoundParts(sd.compound)) continue;
+      if (sd.kind == ShapeKind::Model && !modelExists(sd.compound)) continue;
       btTransform t = ref * btTransform(btQuaternion(qx, qy, qz, qw), toBt(pos));
       Prop* p = createProp(type, sd, material, color, mass, t, friction, restitution);
       if (group != 0) {
@@ -966,7 +1043,12 @@ std::vector<int> World::deserialize(const std::string& data, const btTransform& 
         p->body->setDamping(0.05f, 0.5f);
         p->body->setSleepingThresholds(1.6f, 2.5f);
       }
-      if (frozen) setFrozen(*p, true);
+      if (clientMode) {
+        p->frozen = frozen != 0;
+        makeKinematic(*p);
+      } else if (frozen) {
+        setFrozen(*p, true);
+      }
       idmap[idx] = p->id;
       created.push_back(p->id);
       if (undo) undo->props.push_back(p->id);
@@ -1002,6 +1084,7 @@ std::vector<int> World::deserialize(const std::string& data, const btTransform& 
       if (nj && undo) undo->joints.push_back(nj->id);
     }
   }
+  if (idxToId) *idxToId = idmap;
   return created;
 }
 

@@ -44,10 +44,12 @@ vec3 skyColor(vec3 d) {
 static const char* kMainVS = R"(#version 330 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec3 aColor;
 uniform mat4 uModel;
 uniform mat4 uVP;
-out vec3 vWorldPos; out vec3 vWorldNormal; out vec3 vLocalPos; out vec3 vLocalNormal;
+out vec3 vWorldPos; out vec3 vWorldNormal; out vec3 vLocalPos; out vec3 vLocalNormal; out vec3 vColor;
 void main() {
+  vColor = aColor;
   vec4 wp = uModel * vec4(aPos, 1.0);
   vWorldPos = wp.xyz;
   vWorldNormal = mat3(uModel) * aNormal;
@@ -58,7 +60,7 @@ void main() {
 )";
 
 static const char* kMainFSHead = R"(#version 330 core
-in vec3 vWorldPos; in vec3 vWorldNormal; in vec3 vLocalPos; in vec3 vLocalNormal;
+in vec3 vWorldPos; in vec3 vWorldNormal; in vec3 vLocalPos; in vec3 vLocalNormal; in vec3 vColor;
 out vec4 FragColor;
 uniform vec4 uColor; uniform int uMaterial; uniform bool uWorldTex; uniform vec4 uHighlight; uniform float uEmissive;
 uniform vec3 uBMin; uniform vec3 uBMax;
@@ -90,7 +92,7 @@ void main() {
   vec3 P = uWorldTex ? vWorldPos : vLocalPos;
   vec3 PN = uWorldTex ? N : normalize(vLocalNormal);
   vec2 uv = triUV(P, PN);
-  vec3 albedo = uColor.rgb;
+  vec3 albedo = uColor.rgb * vColor;
   float spec = 0.25, shin = 32.0, emissive = uEmissive, envAmt = 0.0;
 
   if (uMaterial == 1) { // dev grid
@@ -149,6 +151,8 @@ void main() {
     float h = hash(vec3(floor(bx), row, 3.0));
     albedo = mix(albedo * (0.78 + 0.32 * h), vec3(0.72, 0.70, 0.66), mortar);
     spec = 0.03; shin = 6.0;
+  } else if (uMaterial == 12) { // painted (imported models)
+    spec = 0.12; shin = 16.0;
   } else { // plastic
     spec = 0.5; shin = 48.0;
   }
@@ -550,6 +554,76 @@ void Renderer::render() {
   glDisable(GL_CULL_FACE);
   glBindVertexArray(0);
   glUseProgram(0);
+}
+
+GLuint Renderer::renderIcon(const std::vector<DrawCmd>& cmds, int size) {
+  if (cmds.empty()) return 0;
+  // Fit the camera around the transformed mesh bounds.
+  glm::vec3 lo(1e9f), hi(-1e9f);
+  for (const DrawCmd& c : cmds) {
+    if (!c.mesh) continue;
+    for (int i = 0; i < 8; i++) {
+      glm::vec3 p((i & 1) ? c.mesh->bmax.x : c.mesh->bmin.x, (i & 2) ? c.mesh->bmax.y : c.mesh->bmin.y,
+                  (i & 4) ? c.mesh->bmax.z : c.mesh->bmin.z);
+      glm::vec3 w = glm::vec3(c.model * glm::vec4(p, 1));
+      lo = glm::min(lo, w);
+      hi = glm::max(hi, w);
+    }
+  }
+  glm::vec3 centre = (lo + hi) * 0.5f;
+  float radius = std::max(0.05f, glm::length(hi - lo) * 0.5f);
+  const float fovy = glm::radians(28.0f);
+  float dist = radius / std::sin(fovy * 0.5f) * 1.02f;
+  glm::vec3 dir = glm::normalize(glm::vec3(0.65f, 0.45f, 0.75f));
+  glm::vec3 eye = centre + dir * dist;
+  glm::mat4 vp = glm::perspective(fovy, 1.0f, std::max(0.01f, dist - radius * 2), dist + radius * 2) *
+                 glm::lookAt(eye, centre, glm::vec3(0, 1, 0));
+
+  int ss = size * 2;  // render at 2x and mip down for smooth edges
+  GLuint tex, fbo, depth;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ss, ss, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glGenRenderbuffers(1, &depth);
+  glBindRenderbuffer(GL_RENDERBUFFER, depth);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, ss, ss);
+  glGenFramebuffers(1, &fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+  glViewport(0, 0, ss, ss);
+  glClearColor(0, 0, 0, 0);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glEnable(GL_DEPTH_TEST);
+  glDepthFunc(GL_LESS);
+  glDisable(GL_BLEND);
+  glDisable(GL_CULL_FACE);
+
+  glUseProgram(mainProg_);
+  glm::vec3 iconSun = glm::normalize(glm::vec3(0.4f, 0.9f, 0.55f));
+  glUniform3fv(L.camPos, 1, glm::value_ptr(eye));
+  glUniform3fv(L.sunDir, 1, glm::value_ptr(iconSun));
+  glUniform3fv(L.fogColor, 1, glm::value_ptr(kFogColor));
+  glUniform1f(L.fogDensity, 0.0f);
+  glUniform1i(L.numLights, 0);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, shadowTex_);
+  glUniform1i(L.shadowMap, 0);
+  drawList(cmds, vp, false);
+
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glGenerateMipmap(GL_TEXTURE_2D);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glDeleteFramebuffers(1, &fbo);
+  glDeleteRenderbuffers(1, &depth);
+  glViewport(0, 0, width, height);
+  glBindVertexArray(0);
+  glUseProgram(0);
+  return tex;
 }
 
 bool Renderer::saveScreenshot(const std::string& path) {

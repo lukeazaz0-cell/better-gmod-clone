@@ -4,6 +4,7 @@
 
 // ---------------------------------------------------------------------------
 void Notifier::push(const std::string& s, const glm::vec4& color) {
+  if (recordOutbox) outbox.push_back({s, color});
   notes.push_back({s, 0.0f, color});
   while (notes.size() > 6) notes.pop_front();
 }
@@ -12,7 +13,9 @@ void Notifier::update(float dt) {
   while (!notes.empty() && notes.front().t > 5.0f) notes.pop_front();
 }
 
-RayHit GameCtx::trace(float dist) const { return physics.raycast(eye, eye + fwd * dist, player.body); }
+RayHit GameCtx::trace(float dist) const {
+  return physics.raycast(eye, eye + fwd * dist, player.body, COL_WORLD | COL_PROP);
+}
 
 // Steers a body towards a target pose by setting its velocities (used by the physgun / gravgun).
 static void driveBody(btRigidBody* b, const glm::vec3& targetPos, const glm::quat& targetRot, float dt, float gain,
@@ -61,9 +64,12 @@ void Weapon::renderViewmodel(Renderer& r, Assets& assets, const Camera& cam, flo
   glm::mat4 base = vmBase(cam, bob);
   for (const VMPart& p : parts_) {
     ShapeDesc sd{ShapeKind::Box, p.half, ""};
+    if (!p.model.empty()) sd = ShapeDesc{ShapeKind::Model, glm::vec3(1), p.model};
     DrawCmd c;
     c.mesh = assets.mesh(sd);
-    c.model = base * glm::translate(glm::mat4(1), p.offset);
+    c.model = base * glm::translate(glm::mat4(1), p.offset) *
+              glm::rotate(glm::mat4(1), glm::radians(p.yawDeg), glm::vec3(0, 1, 0)) *
+              glm::scale(glm::mat4(1), glm::vec3(p.scale));
     c.material = p.material;
     c.color = glm::vec4(p.color, 1);
     if (p.material == MAT_GLOW) {
@@ -294,13 +300,14 @@ void GravGun::update(GameCtx& c, const Input& in, float dt) {
 void GravGun::preTick(GameCtx& c, float dt) {
   Prop* p = c.world.prop(held_);
   if (!p) return;
+  holdEnd_ = p->pos();
   glm::vec3 target = c.eye + c.fwd * holdDist_;
   driveBody(p->body, target, yawQuat(c.player.yaw) * rel_, dt, 0.4f, 60.0f, 30.0f);
 }
 
 void GravGun::render(GameCtx& c, Renderer& r) {
   if (Prop* p = c.world.prop(held_)) {
-    glm::vec3 e = toGlm(p->renderXf().getOrigin());
+    glm::vec3 e = holdEnd_ = toGlm(p->renderXf().getOrigin());
     r.beam({c.muzzle, e}, glm::vec4(1.0f, 0.6f, 0.2f, 0.5f), 0.12f, true);
     r.light({e, glm::vec3(1.5f, 0.8f, 0.3f), 4.0f});
     c.world.highlights[held_] = glm::vec4(1.0f, 0.6f, 0.2f, 0.7f);
@@ -319,6 +326,13 @@ ToolGun::ToolGun() {
       {{0, 0.02f, -0.3f}, {0.01f, 0.01f, 0.006f}, {1, 1, 1}, MAT_GLOW},
       {{0, -0.1f, 0.07f}, {0.028f, 0.07f, 0.035f}, {0.15f, 0.15f, 0.16f}, MAT_RUBBER},
   };
+  if (modelExists("blaster")) {
+    // Kenney's blaster model (CC0) with a glowing tool screen on its side.
+    parts_ = {
+        {{0.02f, -0.03f, -0.2f}, {0, 0, 0}, {1, 1, 1}, MAT_PAINTED, "blaster", 180.0f, 0.62f},
+        {{-0.085f, 0.015f, -0.15f}, {0.003f, 0.025f, 0.045f}, {1, 1, 1}, MAT_GLOW},
+    };
+  }
   tools = makeTools();
 }
 

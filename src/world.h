@@ -49,6 +49,11 @@ struct Prop {
   std::vector<Attachment> attachments;
   float flash = 0;  // visual highlight timer
 
+  // multiplayer client: interpolation between replicated transforms
+  btTransform netFrom, netTo;
+  float netT = 1;
+  bool netInit = false;
+
   btTransform renderXf() const;
   glm::vec3 pos() const { return toGlm(body->getWorldTransform().getOrigin()); }
 };
@@ -74,6 +79,7 @@ struct Joint {
 
 struct UndoEntry {
   std::string label;
+  int owner = 0;  // player id
   std::vector<int> props, joints;
   std::vector<std::pair<int, int>> attachments;  // (prop id, attachment id)
   bool empty() const { return props.empty() && joints.empty() && attachments.empty(); }
@@ -106,6 +112,7 @@ class World {
                    float mass, const btTransform& xf, float friction = 0.7f, float restitution = 0.1f);
   Prop* spawn(const PropDef& def, const btTransform& xf, UndoEntry* undo);
   std::vector<int> spawnRagdoll(const btTransform& xf, UndoEntry* undo);
+  void ragdollPreview(std::vector<DrawCmd>& out);  // draw commands for a ragdoll in its rest pose
   void removeProp(int id);
   void removeEntity(int id);  // removes the whole group for ragdolls
   Prop* prop(int id);
@@ -134,15 +141,17 @@ class World {
   void preTick(float dt);
   void render(Renderer& r, const Camera& cam);
   bool anyThrusterOn() const { return thrusting_; }
+  bool anyMotorOn() const { return motoring_; }
 
   // --- undo ---
   void pushUndo(const UndoEntry& e);
-  std::string undo();  // returns label of what was undone ("" if nothing)
+  std::string undo(int owner = 0);  // returns label of what was undone ("" if nothing)
   size_t undoCount() const { return undo_.size(); }
 
   // --- save / load / duplicate ---
   std::string serialize(const std::vector<int>& ids, const btTransform& ref, bool includeWorldJoints) const;
-  std::vector<int> deserialize(const std::string& data, const btTransform& ref, UndoEntry* undo);
+  std::vector<int> deserialize(const std::string& data, const btTransform& ref, UndoEntry* undo,
+                               std::map<int, int>* idxToId = nullptr);
   bool saveFile(const std::string& path, const glm::vec3& playerPos, float yaw, float pitch) const;
   bool loadFile(const std::string& path, glm::vec3* playerPos, float* yaw, float* pitch);
 
@@ -151,6 +160,12 @@ class World {
   std::vector<Brush> brushes;
   std::vector<Effect> effects;
   std::map<int, glm::vec4> highlights;  // set by weapons each frame, cleared after render
+
+  // --- multiplayer client mode: no simulation, props are kinematic copies of the host's ---
+  bool clientMode = false;
+  void makeKinematic(Prop& p);
+  void setNetTransform(Prop& p, const btTransform& t, uint8_t flags);
+  void explodeVisual(const glm::vec3& pos, float radius);
   Audio* audio = nullptr;
   std::function<void(const glm::vec3&, float, float)> onExplosion;
   glm::vec3 spawnPoint{0, 0.2f, 14};
@@ -166,5 +181,5 @@ class World {
   Assets& assets;
   std::vector<UndoEntry> undo_;
   int nextId_ = 1, nextGroup_ = 1, nextAttach_ = 1;
-  bool thrusting_ = false;
+  bool thrusting_ = false, motoring_ = false;
 };

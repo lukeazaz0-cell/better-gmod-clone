@@ -1,0 +1,22 @@
+# out_name        source
+impact            Starter-Kit-Racing/audio/impact.ogg
+land              Starter-Kit-FPS/sounds/land.ogg
+break             Starter-Kit-3D-Platformer/sounds/break.ogg
+zap               Starter-Kit-FPS/sounds/blaster_repeater.ogg
+explosion         Starter-Kit-FPS/sounds/enemy_destroy.ogg
+spawn_a           Starter-Kit-City-Builder/sounds/placement-a.ogg
+spawn_b           Starter-Kit-City-Builder/sounds/placement-b.ogg
+spawn_c           Starter-Kit-City-Builder/sounds/placement-c.ogg
+spawn_d           Starter-Kit-City-Builder/sounds/placement-d.ogg
+undo_a            Starter-Kit-City-Builder/sounds/removal-a.ogg
+undo_b            Starter-Kit-City-Builder/sounds/removal-b.ogg
+undo_c            Starter-Kit-City-Builder/sounds/removal-c.ogg
+undo_d            Starter-Kit-City-Builder/sounds/removal-d.ogg
+weapon_change     Starter-Kit-FPS/sounds/weapon_change.ogg
+punt              Starter-Kit-FPS/sounds/enemy_attack.ogg
+freeze            Starter-Kit-3D-Platformer/sounds/coin.ogg
+engine            Starter-Kit-Racing/audio/engine.ogg
+footsteps         Starter-Kit-3D-Platformer/sounds/walking.ogg
+jump              Starter-Kit-3D-Platformer/sounds/jump.ogg
+skid              Starter-Kit-Racing/audio/skid.ogg
+ambience          Starter-Kit-City-Builder/sounds/ambience.ogg

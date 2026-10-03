@@ -16,6 +16,8 @@ struct Notifier {
     glm::vec4 color;
   };
   std::deque<Note> notes;
+  bool recordOutbox = false;  // remote players: messages are forwarded over the network
+  std::vector<std::pair<std::string, glm::vec4>> outbox;
   void push(const std::string& s, const glm::vec4& color = glm::vec4(0.35f, 0.65f, 1.0f, 1.0f));
   void update(float dt);
 };
@@ -24,12 +26,26 @@ struct GameCtx {
   World& world;
   Player& player;
   Physics& physics;
-  Audio& audio;
+  SoundOut& audio;
   Notifier& notify;
   Assets& assets;
   glm::vec3 eye{0}, fwd{0, 0, -1};
   glm::vec3 muzzle{0};
+  int owner = 0;  // player id (undo history is per player)
   RayHit trace(float dist = 4000.0f) const;
+  void pushUndo(UndoEntry u) const {
+    u.owner = owner;
+    world.pushUndo(u);
+  }
+};
+
+// Visits a tool's settings so they can be sent over the network.
+struct ParamIO {
+  virtual ~ParamIO() = default;
+  virtual void f(float& v) = 0;
+  virtual void i(int& v) = 0;
+  virtual void b(bool& v) = 0;
+  virtual void c(glm::vec4& v) = 0;
 };
 
 struct ToolHit {
@@ -52,6 +68,11 @@ class Tool {
   virtual void settings() {}
   virtual void reset() { stage = 0; }
   virtual int highlight() const { return stage > 0 ? firstProp : -1; }
+  virtual void params(ParamIO&) {}
+  std::string saveSettings();
+  void loadSettings(const std::string& s);
+  int getStage() const { return stage; }
+  void setStage(int s) { stage = s; }
 
  protected:
   int stage = 0;
@@ -63,6 +84,9 @@ std::vector<std::unique_ptr<Tool>> makeTools();
 struct VMPart {
   glm::vec3 offset, half, color;
   int material;
+  std::string model = "";  // imported model instead of a box
+  float yawDeg = 0;
+  float scale = 1;
 };
 
 class Weapon {
@@ -76,6 +100,8 @@ class Weapon {
   virtual bool locksView() const { return false; }
   virtual bool consumesWheel() const { return false; }
   virtual bool active() const { return false; }  // drives the glow on the viewmodel
+  virtual int beamInfo(glm::vec3& end) const { return 0; }  // 0 none, 1 physgun, 2 gravgun, 3 tool shot
+  virtual int heldProp() const { return -1; }
 
   void updateSway(const Input& in, float dt);
   void renderViewmodel(Renderer& r, Assets& assets, const Camera& cam, float bob);
@@ -101,6 +127,11 @@ class PhysGun : public Weapon {
   bool consumesWheel() const override { return held_ >= 0; }
   bool active() const override { return firing_; }
   int held() const { return held_; }
+  int beamInfo(glm::vec3& end) const override {
+    end = beamEnd_;
+    return firing_ ? 1 : 0;
+  }
+  int heldProp() const override { return held_; }
 
  private:
   void release(GameCtx&);
@@ -121,8 +152,14 @@ class GravGun : public Weapon {
   void render(GameCtx&, Renderer&) override;
   void holster(GameCtx&) override;
   bool active() const override { return held_ >= 0 || pulling_; }
+  int beamInfo(glm::vec3& end) const override {
+    end = holdEnd_;
+    return held_ >= 0 ? 2 : 0;
+  }
+  int heldProp() const override { return held_; }
 
  private:
+  glm::vec3 holdEnd_{0};
   int held_ = -1;
   float holdDist_ = 2;
   glm::quat rel_{1, 0, 0, 0};
@@ -137,6 +174,10 @@ class ToolGun : public Weapon {
   void render(GameCtx&, Renderer&) override;
   void holster(GameCtx&) override;
   bool active() const override { return shotTimer_ > 0; }
+  int beamInfo(glm::vec3& end) const override {
+    end = shotEnd_;
+    return shotTimer_ > 0 ? 3 : 0;
+  }
 
   std::vector<std::unique_ptr<Tool>> tools;
   int current = 0;

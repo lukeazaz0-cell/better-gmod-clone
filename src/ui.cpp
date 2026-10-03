@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <filesystem>
 #include "game.h"
+#include "net.h"
 
 namespace ui {
 
@@ -112,7 +113,7 @@ void drawHUD(Game& g) {
       dl->AddText(font, font->FontSize, ImVec2(p.x + 16, p.y + 52 + hs.y + 4), IM_COL32(130, 200, 255, 255),
                   help.c_str());
     }
-  } else if (g.curWeapon == 0 && g.physgun()->held() >= 0) {
+  } else if (g.curWeapon == 0 && g.localHeld() >= 0) {
     const char* h = "E + mouse: rotate   Shift: snap   Scroll: distance   Right click: freeze";
     ImVec2 ts = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0, h);
     textShadow(dl, font, font->FontSize, ImVec2(c.x - ts.x * 0.5f, H - 90), IM_COL32(180, 220, 255, 255), h);
@@ -121,9 +122,16 @@ void drawHUD(Game& g) {
   // Stats (top-right)
   {
     char buf[256];
-    snprintf(buf, sizeof(buf), "%.0f FPS   Props: %zu   Constraints: %zu%s%s", g.fps, g.world.props.size(),
+    std::string mp;
+    if (g.net->isHost())
+      mp = "   Hosting (" + std::to_string(g.net->remoteCount() + 1) + " players)";
+    else if (g.net->connected())
+      mp = "   Online (" + std::to_string(g.net->playerList.size()) + " players)";
+    else if (g.net->isClient())
+      mp = "   Connecting...";
+    snprintf(buf, sizeof(buf), "%.0f FPS   Props: %zu   Constraints: %zu%s%s%s", g.fps, g.world.props.size(),
              g.world.joints.size(), g.player.noclip ? "   [NOCLIP]" : "",
-             g.physics.timeScale != 1.0f ? "   [TIMESCALE]" : "");
+             g.physics.timeScale != 1.0f ? "   [TIMESCALE]" : "", mp.c_str());
     ImVec2 ts = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0, buf);
     textShadow(dl, font, font->FontSize, ImVec2(W - ts.x - 16, 12), IM_COL32(230, 230, 230, 230), buf);
   }
@@ -143,6 +151,36 @@ void drawHUD(Game& g) {
     }
   }
 
+  // Player name tags
+  {
+    glm::mat4 vp = g.renderer.viewProj();
+    for (auto& t : g.nameTags) {
+      glm::vec4 c4 = vp * glm::vec4(t.pos, 1);
+      if (c4.w <= 0.1f) continue;
+      glm::vec3 ndc = glm::vec3(c4) / c4.w;
+      if (std::fabs(ndc.x) > 1.1f || std::fabs(ndc.y) > 1.1f) continue;
+      ImVec2 ts = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0, t.name.c_str());
+      ImVec2 p((ndc.x * 0.5f + 0.5f) * W - ts.x * 0.5f, (0.5f - ndc.y * 0.5f) * H - ts.y);
+      dl->AddRectFilled(ImVec2(p.x - 6, p.y - 3), ImVec2(p.x + ts.x + 6, p.y + ts.y + 3), IM_COL32(10, 12, 18, 150), 4);
+      dl->AddText(font, font->FontSize, p, IM_COL32(255, 255, 255, 240), t.name.c_str());
+    }
+  }
+
+  // Chat (bottom-left)
+  {
+    float y = H - 120;
+    int shown = 0;
+    for (auto it = g.net->chatLines.rbegin(); it != g.net->chatLines.rend() && shown < 8; ++it, ++shown) {
+      float a = g.chatOpen ? 1.0f : std::max(0.0f, std::min(1.0f, (12.0f - it->t) / 2.0f));
+      if (a <= 0) break;
+      ImVec2 ts = font->CalcTextSizeA(font->FontSize, FLT_MAX, 520, it->text.c_str());
+      y -= ts.y + 4;
+      ImU32 c = col(glm::vec4(glm::vec3(it->color), a));
+      dl->AddText(font, font->FontSize, ImVec2(19, y + 1), IM_COL32(0, 0, 0, (int)(200 * a)), it->text.c_str(), nullptr, 520);
+      dl->AddText(font, font->FontSize, ImVec2(18, y), c, it->text.c_str(), nullptr, 520);
+    }
+  }
+
   if (g.hintTimer > 0 && !g.spawnMenu) {
     const char* h = "Hold Q for the spawn menu  -  F1 for controls";
     float a = std::min(1.0f, g.hintTimer);
@@ -157,20 +195,33 @@ static void propsTab(Game& g) {
   for (const std::string& category : propCategories()) {
     ImGui::SeparatorText(category.c_str());
     float avail = ImGui::GetContentRegionAvail().x;
-    const float bw = 118, bh = 64;
-    int perRow = std::max(1, (int)((avail + 8) / (bw + 8)));
+    const float icon = 96, cell = icon + 12;
+    int perRow = std::max(1, (int)((avail + 8) / (cell + 8)));
     int n = 0;
     for (const PropDef& d : cat) {
-      if (d.category != category) continue;
+      if (d.category != category || !propAvailable(d)) continue;
       if (n % perRow != 0) ImGui::SameLine();
       ImGui::PushID(d.id.c_str());
-      glm::vec3 c = glm::vec3(d.color) * 0.55f;
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(c.r, c.g, c.b, 0.9f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(c.r * 1.5f + 0.1f, c.g * 1.5f + 0.1f, c.b * 1.5f + 0.1f, 1));
-      if (ImGui::Button(d.name.c_str(), ImVec2(bw, bh))) g.spawnProp(d);
-      ImGui::PopStyleColor(2);
+      ImGui::BeginGroup();
+      auto it = g.icons.find(d.id);
+      bool clicked;
+      if (it != g.icons.end() && it->second) {
+        clicked = ImGui::ImageButton("##icon", (ImTextureID)(intptr_t)it->second, ImVec2(icon, icon), ImVec2(0, 1),
+                                     ImVec2(1, 0), ImVec4(0.2f, 0.23f, 0.28f, 1.0f));
+      } else {
+        clicked = ImGui::Button(d.name.c_str(), ImVec2(icon + 8, icon + 8));
+      }
+      if (clicked) g.spawnProp(d);
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s\n%s, %.1f kg", d.name.c_str(), materialName(d.material), d.mass);
+      // centred, clipped caption
+      ImVec2 ts = ImGui::CalcTextSize(d.name.c_str());
+      float x0 = ImGui::GetCursorPosX();
+      if (ts.x < cell) ImGui::SetCursorPosX(x0 + (cell - ts.x) * 0.5f);
+      ImGui::PushTextWrapPos(x0 + cell);
+      ImGui::TextUnformatted(d.name.c_str());
+      ImGui::PopTextWrapPos();
+      ImGui::EndGroup();
       ImGui::PopID();
       n++;
     }
@@ -202,6 +253,9 @@ static void savesTab(Game& g) {
 
 static void optionsTab(Game& g) {
   ImGui::SeparatorText("Physics");
+  if (g.net->isClient()) {
+    ImGui::TextDisabled("Physics settings are controlled by the host.");
+  } else {
   float grav = g.physics.gravity();
   if (ImGui::SliderFloat("Gravity", &grav, 0.0f, 30.0f, "%.2f m/s^2")) g.physics.setGravity(grav);
   ImGui::SliderFloat("Time scale", &g.physics.timeScale, 0.05f, 2.0f);
@@ -223,6 +277,7 @@ static void optionsTab(Game& g) {
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) g.confirmClear = false;
   }
+  }
 
   ImGui::SeparatorText("Player");
   ImGui::SliderFloat("Mouse sensitivity", &g.mouseSens, 0.0005f, 0.008f, "%.4f");
@@ -237,6 +292,8 @@ static void optionsTab(Game& g) {
   ImGui::SliderFloat("Shadow range", &g.renderer.shadowRange, 20, 200, "%.0f m");
   ImGui::SliderFloat("Volume", &g.audio.masterVolume, 0, 1);
 }
+
+static void multiplayerTab(Game& g);
 
 void drawSpawnMenu(Game& g) {
   ImGuiIO& io = ImGui::GetIO();
@@ -256,6 +313,10 @@ void drawSpawnMenu(Game& g) {
     }
     if (ImGui::BeginTabItem("Saves")) {
       savesTab(g);
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Multiplayer")) {
+      multiplayerTab(g);
       ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Options")) {
@@ -297,6 +358,53 @@ void drawSpawnMenu(Game& g) {
   ImGui::End();
 }
 
+void drawChat(Game& g) {
+  ImGuiIO& io = ImGui::GetIO();
+  ImGui::SetNextWindowPos(ImVec2(16, io.DisplaySize.y - 110));
+  ImGui::SetNextWindowSize(ImVec2(540, 0));
+  ImGui::Begin("##chat", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+  ImGui::Text("Say:");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(-1);
+  if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+  if (ImGui::InputText("##say", g.chatBuf, sizeof(g.chatBuf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+    g.net->chat(g.chatBuf);
+    g.chatBuf[0] = 0;
+    g.chatOpen = false;
+  }
+  ImGui::End();
+}
+
+static void multiplayerTab(Game& g) {
+  Net& n = *g.net;
+  static char name[64] = "";
+  if (!name[0]) snprintf(name, sizeof(name), "%s", g.playerName.c_str());
+  if (ImGui::InputText("Your name", name, sizeof(name))) g.playerName = name;
+  ImGui::Separator();
+  if (n.offline()) {
+    ImGui::SeparatorText("Host a game");
+    ImGui::InputInt("UDP port", &g.hostPort);
+    if (ImGui::Button("Start hosting", ImVec2(200, 0))) g.hostGame(g.hostPort);
+    ImGui::TextDisabled("Others join with your IP address (forward UDP port %d for internet play).", g.hostPort);
+    ImGui::SeparatorText("Join a game");
+    ImGui::InputText("Address", g.joinAddr, sizeof(g.joinAddr));
+    ImGui::TextDisabled("host or host:port (default port 27015)");
+    if (ImGui::Button("Join", ImVec2(200, 0))) g.joinGame(g.joinAddr);
+  } else {
+    ImGui::TextWrapped("%s", n.status.c_str());
+    if (ImGui::Button(n.isHost() ? "Stop hosting" : "Disconnect", ImVec2(200, 0))) n.disconnect();
+  }
+  if (!n.status.empty() && n.offline()) ImGui::TextDisabled("Last status: %s", n.status.c_str());
+  ImGui::SeparatorText("Players");
+  if (n.offline())
+    ImGui::TextDisabled("Single player");
+  else
+    for (auto& p : n.playerList) ImGui::BulletText("%s", p.c_str());
+  ImGui::SeparatorText("Chat");
+  ImGui::TextDisabled("Press T or Enter in game to chat.");
+}
+
 void drawPauseMenu(Game& g) {
   ImGuiIO& io = ImGui::GetIO();
   ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 140));
@@ -328,6 +436,7 @@ void drawHelp(Game& g) {
       {"V", "Toggle noclip"},
       {"F5 / F9", "Quick save / quick load"},
       {"F12", "Screenshot"},
+      {"T / Enter", "Chat"},
       {"Esc", "Pause menu"},
       {"", ""},
       {"Physics Gun", ""},

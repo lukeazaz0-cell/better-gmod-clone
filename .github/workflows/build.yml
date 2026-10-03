@@ -21,8 +21,13 @@ jobs:
         run: |
           SDL_AUDIODRIVER=dummy xvfb-run -a -s "-screen 0 1280x720x24" \
             ./build/gmodclone --width 1280 --height 720 --autotest --shots .
+      - name: Multiplayer test (host + client)
+        run: tools/net_selftest.sh ./build/gmodclone .
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: autotest-screenshots
-          path: autotest_*.bmp
+          path: |
+            autotest_*.bmp
+            net_*.bmp
+            net_*.log

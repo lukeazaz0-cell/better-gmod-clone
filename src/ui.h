@@ -7,4 +7,5 @@ void drawHUD(Game& g);
 void drawSpawnMenu(Game& g);
 void drawPauseMenu(Game& g);
 void drawHelp(Game& g);
+void drawChat(Game& g);
 }  // namespace ui

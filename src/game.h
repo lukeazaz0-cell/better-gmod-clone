@@ -1,5 +1,6 @@
 #pragma once
 #include <SDL.h>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,15 +14,23 @@
 #include "world.h"
 
 struct ImFont;
+class Net;
 
 class Game {
  public:
+  Game();
+  ~Game();
   bool init(int argc, char** argv);
   void run();
   void shutdown();
 
   // --- used by the UI ---
   void spawnProp(const PropDef& def);
+  void spawnPropFor(const PropDef& def, const glm::vec3& eye, const glm::vec3& fwd, float yaw, int owner,
+                    SoundOut& sound);
+  int localHeld();
+  bool hostGame(int port);
+  bool joinGame(const std::string& address);
   void selectWeapon(int i);
   void doUndo();
   bool saveGame(const std::string& name);
@@ -53,7 +62,20 @@ class Game {
   float hintTimer = 12.0f;
   std::string saveDir, saveName = "my_save";
   ImFont* fontBig = nullptr;
+  std::map<std::string, unsigned int> icons;  // prop id -> GL texture
+  void buildIcons();
   bool confirmClear = false;
+  std::unique_ptr<Net> net;
+  bool chatOpen = false;
+  char chatBuf[200] = {};
+  std::string playerName = "Player";
+  char joinAddr[128] = "127.0.0.1";
+  int hostPort = 27015;
+  struct NameTag {
+    glm::vec3 pos;
+    std::string name;
+  };
+  std::vector<NameTag> nameTags;
 
  private:
   void handleEvent(const SDL_Event& e);
@@ -62,6 +84,10 @@ class Game {
   void playImpactSounds();
   void autotestStep(float dt);
   void screenshot(const std::string& path);
+  void renderPlayers(const Camera& cam);
+  void releaseAllInput();
+  bool suppressText_ = false;
+  void netAutotestStep(float dt);
 
   SDL_Window* window_ = nullptr;
   SDL_GLContext gl_ = nullptr;
@@ -70,6 +96,9 @@ class Game {
   float shake_ = 0, impactCooldown_ = 0;
   bool autotest_ = false;
   int autoFrame_ = 0;
+  int modelProps_ = 0;
+  int netTest_ = 0;  // 1 = host, 2 = client
+  std::string startHost_, startJoin_;
   std::string shotDir_ = ".";
   bool wantScreenshot_ = false;
   std::string pendingShot_;

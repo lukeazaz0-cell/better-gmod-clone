@@ -51,6 +51,9 @@ class Renderer {
   void render();
 
   bool saveScreenshot(const std::string& path);
+  // Renders the given draw commands into a new size x size RGBA texture (transparent background).
+  GLuint renderIcon(const std::vector<DrawCmd>& cmds, int size);
+  const glm::mat4& viewProj() const { return vp_; }
 
   int width = 1280, height = 720;
   bool shadows = true;

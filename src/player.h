@@ -6,6 +6,9 @@
 class Player {
  public:
   void init(Physics& phys, const glm::vec3& feet, float yaw);
+  // Host-side stand-in for a network player: a kinematic capsule moved by the client.
+  void initRemote(Physics& phys, const glm::vec3& feet);
+  void setRemoteState(const glm::vec3& feet, const glm::vec3& eye, float yaw, float pitch, bool noclip);
   void shutdown();
   void look(float dx, float dy, float sensitivity);
   void update(const Input& in, float dt, bool controlsEnabled);  // before physics step
@@ -23,6 +26,7 @@ class Player {
   bool noclip = false, onGround = false, crouching = false;
   float yaw = 0, pitch = 0;
   float bob = 0, speedH = 0;
+  bool jumped = false;  // set on the frame a jump starts
   glm::vec3 respawnPoint{0, 0.2f, 0};
   float respawnYaw = 0;
 
