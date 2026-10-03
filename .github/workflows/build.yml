@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libsdl2-dev libbullet-dev libglm-dev xvfb libgl1-mesa-dri
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+      - name: Autotest (headless)
+        run: |
+          SDL_AUDIODRIVER=dummy xvfb-run -a -s "-screen 0 1280x720x24" \
+            ./build/gmodclone --width 1280 --height 720 --autotest --shots .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: autotest-screenshots
+          path: autotest_*.bmp

@@ -1,0 +1,5 @@
+build/
+build-*/
+*.bmp
+compile_commands.json
+.cache/
